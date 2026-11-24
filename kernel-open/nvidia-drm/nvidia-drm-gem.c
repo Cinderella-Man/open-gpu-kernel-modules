@@ -100,7 +100,7 @@ static struct drm_gem_object_funcs nv_drm_gem_funcs = {
     .get_sg_table = nv_drm_gem_prime_get_sg_table,
 
 #if !defined(NV_DRM_DRIVER_HAS_GEM_PRIME_CALLBACKS)
-    .export  = drm_gem_prime_export,
+    .export  = nv_drm_gem_prime_export,
 #if defined(NV_DRM_GEM_OBJECT_VMAP_HAS_MAP_ARG)
     .vmap    = nv_drm_gem_vmap,
     .vunmap  = nv_drm_gem_vunmap,
@@ -153,6 +153,15 @@ struct drm_gem_object *nv_drm_gem_prime_import(struct drm_device *dev,
 
     if (dma_buf->owner == dev->driver->fops->owner) {
         nv_gem_src = to_nv_gem_object(dma_buf->priv);
+
+        if (nv_drm_is_vidmem_dmabuf(dma_buf)) {
+            if (nv_gem_src->base.dev == dev) {
+                drm_gem_object_get(&nv_gem_src->base);
+                return &nv_gem_src->base;
+            }
+            /* Another GPU: attach, and get a DMA address in the exporter's BAR1. */
+            return drm_gem_prime_import(dev, dma_buf);
+        }
 
         if (nv_gem_src->base.dev != dev &&
             nv_gem_src->ops->prime_dup != NULL) {

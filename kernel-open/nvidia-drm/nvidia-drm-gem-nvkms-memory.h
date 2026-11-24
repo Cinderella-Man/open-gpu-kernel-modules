@@ -109,6 +109,10 @@ int nv_drm_dumb_destroy(struct drm_file *file,
                         uint32_t handle);
 #endif /* NV_DRM_DRIVER_HAS_DUMB_DESTROY */
 
+struct dma_buf;
+struct dma_buf *nv_drm_gem_prime_export(struct drm_gem_object *gem, int flags);
+bool nv_drm_is_vidmem_dmabuf(const struct dma_buf *dma_buf);
+
 struct drm_gem_object *nv_drm_gem_nvkms_prime_import(
     struct drm_device *dev,
     struct drm_gem_object *gem);
