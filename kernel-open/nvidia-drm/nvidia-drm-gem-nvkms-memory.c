@@ -773,4 +773,157 @@ int nv_drm_dumb_destroy(struct drm_file *file,
 }
 #endif /* NV_DRM_DRIVER_HAS_DUMB_DESTROY */
 
+/*
+ * Peer export of video memory (opt-in: nvidia-drm.peer_vidmem_dmabuf=1).
+ *
+ * The generic PRIME path only describes system memory (struct pages), and a
+ * buffer imported from another NVIDIA GPU goes through NVKMS dupMemory(),
+ * which fails across GPUs. With this option, a video-memory buffer is
+ * exported with its own dma-buf ops: each attachment gets a one-entry
+ * sg_table without pages, whose DMA address is the buffer's BAR1 window
+ * mapped for the importing device. nvidia.ko on the importing GPU already
+ * takes such page-less SGTs as they are (nv_register_sgt, nv_dma_map_sgt).
+ *
+ * Everything that calls into RM (the BAR1 mapping, the GC6 blocker) happens
+ * at export time, from the PRIME ioctl. nvidia.ko may attach and map the
+ * dma-buf while it holds its own API lock (NVOS32_DESCRIPTOR_TYPE_OS_DMA_BUF_PTR),
+ * where a nested RM call is refused, so map_dma_buf only does DMA mapping.
+ * The GC6 blocker is taken once per buffer, like a CPU mapping's, and the
+ * buffer's free path drops it (was_mmapped).
+ *
+ * Move data one way at a time: NVIDIA warns that full-duplex traffic over
+ * BAR1 can deadlock.
+ */
+#include <linux/dma-buf.h>
+#include <linux/dma-mapping.h>
+#include <linux/scatterlist.h>
+#include <linux/slab.h>
+#include <linux/moduleparam.h>
+
+static bool nv_drm_peer_vidmem_dmabuf;
+module_param_named(peer_vidmem_dmabuf, nv_drm_peer_vidmem_dmabuf, bool, 0400);
+MODULE_PARM_DESC(peer_vidmem_dmabuf,
+                 "Export video memory as dma-bufs another GPU can import (memory sharing through BAR1, not CUDA P2P)");
+
+static struct sg_table *nv_drm_vidmem_map_dma_buf(
+    struct dma_buf_attachment *attach,
+    enum dma_data_direction dir)
+{
+    struct drm_gem_object *gem = attach->dmabuf->priv;
+    struct nv_drm_gem_nvkms_memory *mem =
+        to_nv_nvkms_memory(to_nv_gem_object(gem));
+    struct sg_table *sgt;
+    dma_addr_t addr;
+
+    /* Mapped at export time; nothing here may call into RM. */
+    if (!mem->physically_mapped || mem->pPhysicalAddress == NULL) {
+        return ERR_PTR(-EINVAL);
+    }
+
+    addr = dma_map_resource(attach->dev,
+                            (phys_addr_t)(uintptr_t)mem->pPhysicalAddress,
+                            gem->size, dir, DMA_ATTR_SKIP_CPU_SYNC);
+    if (dma_mapping_error(attach->dev, addr)) {
+        return ERR_PTR(-EIO);
+    }
+
+    sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+    if (sgt == NULL || sg_alloc_table(sgt, 1, GFP_KERNEL) != 0) {
+        kfree(sgt);
+        dma_unmap_resource(attach->dev, addr, gem->size, dir,
+                           DMA_ATTR_SKIP_CPU_SYNC);
+        return ERR_PTR(-ENOMEM);
+    }
+    sg_set_page(sgt->sgl, NULL, gem->size, 0);
+    sg_dma_address(sgt->sgl) = addr;
+    sg_dma_len(sgt->sgl) = gem->size;
+
+    return sgt;
+}
+
+static void nv_drm_vidmem_unmap_dma_buf(
+    struct dma_buf_attachment *attach,
+    struct sg_table *sgt,
+    enum dma_data_direction dir)
+{
+    dma_unmap_resource(attach->dev, sg_dma_address(sgt->sgl),
+                       sg_dma_len(sgt->sgl), dir, DMA_ATTR_SKIP_CPU_SYNC);
+    sg_free_table(sgt);
+    kfree(sgt);
+}
+
+static const struct dma_buf_ops nv_drm_vidmem_dmabuf_ops = {
+    .attach = drm_gem_map_attach,
+    .detach = drm_gem_map_detach,
+    .map_dma_buf = nv_drm_vidmem_map_dma_buf,
+    .unmap_dma_buf = nv_drm_vidmem_unmap_dma_buf,
+    .release = drm_gem_dmabuf_release,
+    .mmap = drm_gem_dmabuf_mmap,
+    .vmap = drm_gem_dmabuf_vmap,
+    .vunmap = drm_gem_dmabuf_vunmap,
+};
+
+bool nv_drm_is_vidmem_dmabuf(const struct dma_buf *dma_buf)
+{
+    return dma_buf->ops == &nv_drm_vidmem_dmabuf_ops;
+}
+
+/* BAR1 mapping and GC6 blocker for a peer export; called without RM locks held. */
+static int nv_drm_vidmem_prepare_export(struct nv_drm_gem_object *nv_gem)
+{
+    struct nv_drm_gem_nvkms_memory *mem = to_nv_nvkms_memory(nv_gem);
+    int ret;
+
+    if (nv_gem->base.size > UINT_MAX) {
+        return -E2BIG; /* one scatterlist entry */
+    }
+
+    ret = __nv_drm_gem_nvkms_map(mem);
+    if (ret != 0) {
+        return ret;
+    }
+    if (!mem->physically_mapped || mem->pPhysicalAddress == NULL) {
+        return -EINVAL;
+    }
+
+    mutex_lock(&mem->map_lock);
+    if (!mem->was_mmapped) {
+        if (!nvKms->gc6BlockerRefCntInc(nv_gem->nv_dev->pDevice)) {
+            mutex_unlock(&mem->map_lock);
+            return -ENOMEM;
+        }
+        mem->was_mmapped = true;
+    }
+    mutex_unlock(&mem->map_lock);
+
+    return 0;
+}
+
+struct dma_buf *nv_drm_gem_prime_export(struct drm_gem_object *gem, int flags)
+{
+    struct nv_drm_gem_object *nv_gem = to_nv_gem_object(gem);
+
+    if (nv_drm_peer_vidmem_dmabuf &&
+        nv_gem->ops == &nv_gem_nvkms_memory_ops &&
+        nv_gem->pMemory != NULL &&
+        nvKms->isVidmem(nv_gem->pMemory)) {
+        DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+        int ret = nv_drm_vidmem_prepare_export(nv_gem);
+
+        if (ret != 0) {
+            return ERR_PTR(ret);
+        }
+
+        exp_info.ops = &nv_drm_vidmem_dmabuf_ops;
+        exp_info.size = gem->size;
+        exp_info.flags = flags;
+        exp_info.priv = gem;
+        exp_info.resv = gem->resv;
+
+        return drm_gem_dmabuf_export(gem->dev, &exp_info);
+    }
+
+    return drm_gem_prime_export(gem, flags);
+}
+
 #endif
